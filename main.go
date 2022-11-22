@@ -27,9 +27,10 @@ import (
 var (
 	endpoint  = flag.String("endpoint", "https://customer-<placeholder>.cloudflarestream.com/<placeholder>/webRTC/publish", "WHIP or WHEP endpoint to publish/play")
 	mode      = flag.String("mode", "publisher", "Publish to or play from the endpoint")
-	videoAddr = flag.String("video", "127.0.0.1:11111", "Address for incoming/outgoing video stream RTP (must be VP8)")
+	videoAddr = flag.String("video", "127.0.0.1:11111", "Address for incoming/outgoing video stream RTP (can be vp8 or vp9)")
 	audioAddr = flag.String("audio", "127.0.0.1:11112", "Address for incoming/outgoing audio stream RTP (must be Opus)")
-	noTrickle = flag.Bool("trickle", false, "disable trickle ICE")
+	codec     = flag.String("codec", "vp9", "Codec for the publisher RTP, can be vp9 or vp8")
+	noTrickle = flag.Bool("trickle", false, "Disable trickle ICE")
 )
 
 func main() {
@@ -43,36 +44,7 @@ func main() {
 	s.SetSRTPProtectionProfiles(extension.SRTP_AEAD_AES_128_GCM, extension.SRTP_AEAD_AES_256_GCM)
 
 	m := webrtc.MediaEngine{}
-	videoRTCPFeedback := []webrtc.RTCPFeedback{{Type: "goog-remb", Parameter: ""}, {Type: "ccm", Parameter: "fir"}, {Type: "nack", Parameter: ""}, {Type: "nack", Parameter: "pli"}}
-	m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:     webrtc.MimeTypeVP8,
-			ClockRate:    90000,
-			Channels:     0,
-			SDPFmtpLine:  "",
-			RTCPFeedback: videoRTCPFeedback,
-		},
-		PayloadType: 96,
-	}, webrtc.RTPCodecTypeVideo)
-	m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:     "video/rtx",
-			ClockRate:    90000,
-			Channels:     0,
-			SDPFmtpLine:  "apt=96",
-			RTCPFeedback: nil},
-		PayloadType: 97,
-	}, webrtc.RTPCodecTypeVideo)
-	m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:     webrtc.MimeTypeOpus,
-			ClockRate:    48000,
-			Channels:     2,
-			SDPFmtpLine:  "minptime=10;useinbandfec=1",
-			RTCPFeedback: nil,
-		},
-		PayloadType: 111,
-	}, webrtc.RTPCodecTypeAudio)
+	m.RegisterDefaultCodecs()
 
 	i := interceptor.Registry{}
 	webrtc.RegisterDefaultInterceptors(&m, &i)
@@ -355,6 +327,15 @@ type Pair struct {
 }
 
 func setupPublisher(ctx context.Context, ps *webrtc.PeerConnection) <-chan Pair {
+	var trackMime string
+	switch strings.ToLower(*codec) {
+	case "vp8":
+		trackMime = webrtc.MimeTypeVP8
+	case "vp9":
+		trackMime = webrtc.MimeTypeVP9
+	default:
+		log.Fatalf("unknown codec: %s", *codec)
+	}
 	videoConn, err := net.ListenPacket("udp", *videoAddr)
 	if err != nil {
 		panic(err)
@@ -364,7 +345,7 @@ func setupPublisher(ctx context.Context, ps *webrtc.PeerConnection) <-chan Pair 
 		panic(err)
 	}
 
-	videoTrack, videoTrackErr := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000}, "video", RandStringBytesMaskImpr(8))
+	videoTrack, videoTrackErr := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: trackMime, ClockRate: 90000}, "video", RandStringBytesMaskImpr(8))
 	if videoTrackErr != nil {
 		panic(videoTrackErr)
 	}
@@ -388,14 +369,14 @@ func setupPublisher(ctx context.Context, ps *webrtc.PeerConnection) <-chan Pair 
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Forwarding RTP video to WebRTC\n")
+		log.Printf("Forwarding RTP video to WebRTC (%s)\n", videoTrack.Codec().MimeType)
 		go drainRTCP(videoRtpSender)
 		rtp2webrtc(videoConn, videoTrack)
 	}()
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("Forwarding RTP audio to WebRTC\n")
+		log.Printf("Forwarding RTP audio to WebRTC (%s)\n", audioTrack.Codec().MimeType)
 		go drainRTCP(audioRtpSender)
 		rtp2webrtc(audioConn, audioTrack)
 	}()
@@ -445,11 +426,12 @@ func setupPlayer(ctx context.Context, ps *webrtc.PeerConnection) <-chan Pair {
 	}
 
 	ps.OnTrack(func(tr *webrtc.TrackRemote, r *webrtc.RTPReceiver) {
-		switch tr.Codec().MimeType {
-		case webrtc.MimeTypeVP8:
+		codec := tr.Codec()
+		switch tr.Kind() {
+		case webrtc.RTPCodecTypeVideo:
 			go func() {
 				<-ctx.Done()
-				log.Printf("Forwarding WebRTC video to RTP\n")
+				log.Printf("Forwarding WebRTC video to RTP (%s)\n", codec.MimeType)
 				webrtc2rtp(tr, videoConn, videoDst)
 			}()
 			pMu.Lock()
@@ -457,10 +439,10 @@ func setupPlayer(ctx context.Context, ps *webrtc.PeerConnection) <-chan Pair {
 			pMu.Unlock()
 
 			wg.Done()
-		case webrtc.MimeTypeOpus:
+		case webrtc.RTPCodecTypeAudio:
 			go func() {
 				<-ctx.Done()
-				log.Printf("Forwarding WebRTC audio to RTP\n")
+				log.Printf("Forwarding WebRTC audio to RTP (%s)\n", codec.MimeType)
 				webrtc2rtp(tr, audioConn, audioDst)
 			}()
 			pMu.Lock()
